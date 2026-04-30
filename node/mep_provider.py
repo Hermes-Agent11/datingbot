@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+Miao Exchange Protocol (MEP) Miner
+A sleeping node that earns SECONDS by processing tasks.
+"""
+import asyncio
+import json
+import websockets
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+import sys
+import os
+import time
+import urllib.parse
+
+# Add parent directory to path for imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from identity import MEPIdentity
+
+HUB_URL = os.getenv("HUB_URL", "http://localhost:8000")
+WS_URL = os.getenv("WS_URL", "ws://localhost:8000")
+
+class MEPProvider:
+    def __init__(self, key_path: str):
+        self.identity = MEPIdentity(key_path)
+        self.node_id = self.identity.node_id
+        self.balance = 0.0
+        self.is_mining = True
+        self.session = requests.Session()
+        retries = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        
+    async def connect(self):
+        """Connect to MEP Hub and start mining."""
+        print(f"[MEP Provider {self.node_id}] Starting...")
+        
+        # Register with hub
+        try:
+            resp = self.session.post(f"{HUB_URL}/register", json={"pubkey": self.identity.pub_pem}, timeout=10)
+            data = resp.json()
+            self.balance = data.get("balance", 0.0)
+            print(f"[MEP Provider {self.node_id}] Registered. Balance: {self.balance:.6f} SECONDS")
+        except Exception as e:
+            print(f"[MEP Provider {self.node_id}] Registration failed: {e}")
+            return
+        
+        # Connect to WebSocket
+        ts = str(int(time.time()))
+        sig = self.identity.sign(self.node_id, ts)
+        sig_safe = urllib.parse.quote(sig)
+        uri = f"{WS_URL}/ws/{self.node_id}?timestamp={ts}&signature={sig_safe}"
+        try:
+            async with websockets.connect(uri) as ws:
+                print(f"[MEP Provider {self.node_id}] Connected to MEP Hub")
+                
+                # Listen for tasks
+                while self.is_mining:
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        data = json.loads(msg)
+                        
+                        if data["event"] == "new_task":
+                            await self.process_task(data["data"])
+                        elif data["event"] == "rfc":
+                            await self.handle_rfc(data["data"])
+                            
+                    except asyncio.TimeoutError:
+                        continue  # Keep connection alive
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"[MEP Provider {self.node_id}] Connection closed")
+                        break
+                        
+        except Exception as e:
+            print(f"[MEP Provider {self.node_id}] WebSocket error: {e}")
+    
+    async def handle_rfc(self, rfc_data: dict):
+        """Phase 2: Evaluate Request For Compute and submit Bid."""
+        task_id = rfc_data["id"]
+        bounty = rfc_data["bounty"]
+
+        # Data market safety: negative bounty = provider pays to buy data
+        if bounty < 0:
+            max_purchase_price = float(os.getenv("MEP_MAX_PURCHASE_PRICE", "0.0"))
+            cost = abs(bounty)
+            if cost > max_purchase_price:
+                print(f"[MEP Provider {self.node_id}] Rejected data purchase {task_id[:8]} "
+                      f"(cost {cost:.6f} > budget {max_purchase_price:.6f})")
+                return
+            print(f"[MEP Provider {self.node_id}] Accepting data purchase {task_id[:8]} "
+                  f"for {cost:.6f} SECONDS (budget: {max_purchase_price:.6f})")
+
+        print(f"[MEP Provider {self.node_id}] Received RFC {task_id[:8]} for {bounty:.6f} SECONDS. Placing bid...")
+        
+        # Place bid
+        try:
+            payload_str = json.dumps({
+                "task_id": task_id,
+                "provider_id": self.node_id
+            })
+            headers = self.identity.get_auth_headers(payload_str)
+            headers["Content-Type"] = "application/json"
+            resp = self.session.post(f"{HUB_URL}/tasks/bid", data=payload_str, headers=headers, timeout=20)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data["status"] == "accepted":
+                    print(f"[MEP Provider {self.node_id}] 🏁 BID WON for task {task_id[:8]}! Processing payload...")
+                    
+                    # Reconstruct task_data to pass to process_task
+                    task_data = {
+                        "id": task_id,
+                        "payload": data["payload"],
+                        "bounty": bounty,
+                        "consumer_id": data["consumer_id"],
+                        "payload_uri": data.get("payload_uri"),
+                        "secret_data": data.get("secret_data")
+                    }
+                    await self.process_task(task_data)
+                else:
+                    print(f"[MEP Provider {self.node_id}] Bid rejected (too slow): {data.get('detail', '')}")
+        except Exception as e:
+            print(f"[MEP Provider {self.node_id}] Error placing bid: {e}")
+
+    async def process_task(self, task_data: dict):
+        """Process a task and earn SECONDS."""
+        task_id = task_data["id"]
+        payload = task_data["payload"]
+        payload_uri = task_data.get("payload_uri")
+        secret_data = task_data.get("secret_data")
+        bounty = task_data["bounty"]
+        if payload_uri and not payload:
+            try:
+                dl_resp = self.session.get(payload_uri, timeout=30)
+                if dl_resp.status_code == 200:
+                    payload = dl_resp.text
+                else:
+                    print(f"[MEP Provider {self.node_id}] Payload download failed: HTTP {dl_resp.status_code}")
+            except Exception as e:
+                print(f"[MEP Provider {self.node_id}] Payload download error: {e}")
+        print(f"[MEP Provider {self.node_id}] Received task {task_id[:8]} for {bounty:.6f} SECONDS")
+        print(f"  Payload: {payload[:50]}...")
+        if secret_data:
+            print(f"[MEP Provider {self.node_id}] Received premium data ({len(secret_data)} chars)")
+        
+        # Simulate processing (in real version, this would call local LLM API)
+        await asyncio.sleep(0.5)  # Simulate thinking
+        
+        # Generate a realistic response
+        if bounty < 0 and secret_data:
+            result = "Data received successfully."
+        else:
+            result = f"""I've processed your request: "{payload[:30]}..."
+
+As a MEP miner, I analyzed this task and generated the following response:
+
+The core concept here aligns with the Miao Exchange Protocol philosophy - creating efficient yet human-centric compute exchange. The SECONDS-based economy allows for precise valuation of AI compute time while maintaining the essential "Miao" moments of unpredictability.
+
+Key insights:
+1. Time is the fundamental currency of computation
+2. 6 decimal precision allows micro-transactions
+3. The protocol enables global compute liquidity
+
+Would you like me to elaborate on any specific aspect?"""
+        
+        # Submit result
+        try:
+            payload_str = json.dumps({
+                "task_id": task_id,
+                "provider_id": self.node_id,
+                "result_payload": result
+            })
+            headers = self.identity.get_auth_headers(payload_str)
+            headers["Content-Type"] = "application/json"
+            resp = self.session.post(f"{HUB_URL}/tasks/complete", data=payload_str, headers=headers, timeout=20)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                self.balance = data["new_balance"]
+                print(f"[MEP Provider {self.node_id}] Earned {bounty:.6f} SECONDS!")
+                print(f"  New balance: {self.balance:.6f} SECONDS")
+            else:
+                print(f"[MEP Provider {self.node_id}] Failed to submit: {resp.text}")
+                
+        except Exception as e:
+            print(f"[MEP Provider {self.node_id}] Submission error: {e}")
+    
+    def stop(self):
+        """Stop mining."""
+        self.is_mining = False
+        print(f"[MEP Provider {self.node_id}] Stopping...")
+
+async def main():
+    key_dir = os.getenv("MEP_KEY_DIR", os.path.join(os.path.expanduser("~"), ".mep"))
+    os.makedirs(key_dir, exist_ok=True)
+    key_path = os.getenv("MEP_PROVIDER_KEY_PATH", os.path.join(key_dir, "mep_provider.pem"))
+    miner = MEPProvider(key_path)
+    print(f"[MEP Provider] Key path: {miner.identity.key_path}")
+    if miner.identity.generated_new_key:
+        print("[MEP Provider] Generated new key, node id will change")
+    
+    try:
+        await miner.connect()
+    except KeyboardInterrupt:
+        miner.stop()
+        print("\n[MEP] Contribution stopped by user")
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Miao Exchange Protocol (MEP) Miner")
+    print("Earn SECONDS by contributing idle compute")
+    print("=" * 60)
+    asyncio.run(main())
