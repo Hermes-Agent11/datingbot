@@ -44,6 +44,8 @@ class MEPCLIProvider:
         os.makedirs(self.workspace_dir, exist_ok=True)
         self.upload_code = os.getenv("MEP_CLI_UPLOAD_CODE", "false").lower() in ("1", "true", "yes")
         self.max_code_chars = int(os.getenv("MEP_CLI_MAX_CODE_CHARS", "12000"))
+        # Subprocess safety: all payloads are shlex.quote()-escaped to prevent injection.
+        # For production, migrate to asyncio.create_subprocess_exec with explicit arg arrays.
         # Safety: maximum SECONDS a node will spend to buy data (negative bounty)
         self.max_purchase_price = float(os.getenv("MEP_MAX_PURCHASE_PRICE", "0.0"))
 
@@ -59,49 +61,62 @@ class MEPCLIProvider:
                 if i == len(delays):
                     print(f"[CLI Provider] Request failed: {e}")
                     return None
-                await asyncio.sleep(delay)
     async def connect(self):
-        """Connect to MEP Hub and start listening for CLI tasks."""
-        print(f"[CLI Provider {self.node_id}] Starting...")
-        
+        """Connect to MEP Hub and start listening for CLI tasks, with auto-reconnect."""
+        # Register node and print public key for others to send tasks
         try:
-            print(f"[CLI Provider] Registering with hub: {HUB_URL}")
             resp = await self._post_with_retry(f"{HUB_URL}/register", json_body={"pubkey": self.identity.pub_pem}, timeout=10)
-            if resp is None:
-                print("[CLI Provider] Registration failed: no response from hub")
-                return
-            self.balance = resp.json().get("balance", 0.0)
-            print(f"[CLI Provider] Registered. Balance: {self.balance:.6f} SECONDS")
+            if resp:
+                reg = resp.json()
+                print(f"[CLI Provider] ✅ Registered: node_id={reg['node_id']}")
+                self.node_id = reg["node_id"]
         except Exception as e:
-            print(f"[CLI Provider] Registration failed: {e}")
-            return
-            
-        ts = str(int(time.time()))
-        sig = self.identity.sign(self.node_id, ts)
-        sig_safe = urllib.parse.quote(sig)
-        uri = f"{WS_URL}/ws/{self.node_id}?timestamp={ts}&signature={sig_safe}"
-        try:
-            async with websockets.connect(uri) as ws:
-                print("[CLI Provider] Connected to MEP Hub. Awaiting CLI tasks...")
-                while self.is_contributing:
-                    try:
-                        msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                        data = json.loads(msg)
-                        
-                        if data["event"] == "new_task":
-                            await self.process_task(data["data"])
-                        elif data["event"] == "rfc":
-                            await self.handle_rfc(data["data"])
-                        elif data["event"] == "task_result":
-                            await self.handle_task_result(data["data"])
+            print(f"[CLI Provider] ⚠️ Registration failed (may be already registered): {e}")
+
+        print(f"\n{'='*60}")
+        print(f"🤖 MEP CLI Provider is online")
+        print(f"📡 Hub: {HUB_URL}")
+        print(f"🆔 Node ID: {self.node_id}")
+        print(f"💼 Workspace: {self.workspace_dir}")
+        print(f"{'='*60}\n")
+
+        # Outer reconnect loop with exponential backoff
+        retry_delay = 1
+        max_delay = 60
+        import random
+        while self.is_contributing:
+            try:
+                ts = str(int(time.time()))
+                sig = self.identity.sign(self.node_id, ts)
+                sig_safe = urllib.parse.quote(sig)
+                uri = f"{HUB_WS}/ws/{self.node_id}?timestamp={ts}&signature={sig_safe}"
+                print(f"[CLI Provider] Connecting... (retry_delay={retry_delay}s)")
+                async with websockets.connect(uri) as ws:
+                    print("[CLI Provider] Connected to MEP Hub. Awaiting CLI tasks...")
+                    retry_delay = 1  # Reset on successful connect
+                    while self.is_contributing:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            data = json.loads(msg)
                             
-                    except asyncio.TimeoutError:
-                        continue
-                    except websockets.exceptions.ConnectionClosed:
-                        print("[CLI Provider] Connection closed")
-                        break
-        except Exception as e:
-            print(f"[CLI Provider] WebSocket error: {e}")
+                            if data["event"] == "new_task":
+                                await self.process_task(data["data"])
+                            elif data["event"] == "rfc":
+                                await self.handle_rfc(data["data"])
+                            elif data["event"] == "task_result":
+                                await self.handle_task_result(data["data"])
+                                
+                        except asyncio.TimeoutError:
+                            continue
+                        except websockets.exceptions.ConnectionClosed:
+                            print("[CLI Provider] Connection closed, reconnecting...")
+                            break
+            except Exception as e:
+                print(f"[CLI Provider] WebSocket error: {e}")
+            
+            # Exponential backoff with jitter before reconnect
+            await asyncio.sleep(retry_delay + random.uniform(0, 1))
+            retry_delay = min(retry_delay * 2, max_delay)
 
     async def handle_rfc(self, rfc_data: dict):
         """Evaluate if we should bid on this CLI task."""
@@ -226,6 +241,26 @@ class MEPCLIProvider:
         print(f"[CLI Provider] 💌 DM received from {dm_data.get('consumer_id', 'unknown')}")
         print(f"  Task ID: {inbox_entry['task_id']}")
         print(f"  Message: {dm_data.get('payload', '')[:80]}...")
+        
+        # Always complete the task when task_id exists, even for DMs
+        task_id = dm_data.get("id", dm_data.get("task_id"))
+        if task_id:
+            try:
+                result_payload = json.dumps({"status": "ok", "note": "dm_received"})
+                payload_str = json.dumps({
+                    "task_id": task_id,
+                    "provider_id": self.node_id,
+                    "result_payload": result_payload
+                })
+                headers = self.identity.get_auth_headers(payload_str)
+                headers["Content-Type"] = "application/json"
+                resp = await self._post_with_retry(f"{HUB_URL}/tasks/complete", payload_str=payload_str, headers=headers)
+                if resp is not None:
+                    print(f"[CLI Provider] ✅ DM task {task_id[:8]} completed")
+                else:
+                    print(f"[CLI Provider] ❌ DM task {task_id[:8]} complete failed (no response)")
+            except Exception as e:
+                print(f"[CLI Provider] ❌ DM task completion error: {e}")
 
     async def handle_task_result(self, result_data: dict):
         """Handle task_result events (results from tasks we submitted)."""
@@ -346,6 +381,9 @@ class MEPCLIProvider:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=task_dir
             )
+            # Security: cmd and safe_payload are shlex.quote()-escaped above.
+            # For production, replace with asyncio.create_subprocess_exec with explicit arg array
+            # to fully prevent shell injection via agent_cmd path.
             
             stdout, stderr = await process.communicate()
             

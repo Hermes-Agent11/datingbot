@@ -3,8 +3,8 @@
 # Matching: interest overlap (Jaccard similarity) + age range compatibility
 # Returns top N matches sorted by compatibility score
 
-import json, math, sys
-sys.path.insert(0, "/home/wuyanbingep/.hermes")
+import json, math, sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".hermes"))
 from honcho_memory import HonchoMemory
 
 class MatchEngine:
@@ -14,7 +14,7 @@ class MatchEngine:
     def store_profile(self, node_id: str, profile: dict):
         self.db.save_message(peer_id=node_id, content=json.dumps(profile), role="user", metadata={"type": "profile"})
     
-    def get_profile(self, node_id: str) -> dict | None:
+    def get_profile(self, node_id: str) -> dict:
         entries = self.db.get_session_messages(limit=100)
         for e in entries:
             if e.get("peer_id") == node_id:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """DatingBot MEP Listener — handles dating profiles, matching, and conversations."""
-import asyncio, json, requests, sys, os, urllib.parse, websockets, time
-sys.path.insert(0, "/home/wuyanbingep/clawd/MEP")
+import asyncio, json, requests, sys, os, urllib.parse, websockets, time, random
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "node"))
 from node.identity import MEPIdentity
 from match_engine import MatchEngine
 from profile_schema import validate_profile
@@ -74,8 +74,10 @@ async def handle_task(data: dict):
         result = {"status": "ok", "profile": profile} if profile else {"status": "error", "message": "Profile not found"}
     
     else:
+        # chat/default fallback — always completes
         result = {"status": "ok", "reply": "❤️ DatingBot received your message. Use task_type: register_profile to set up your profile, or find_match to find matches."}
     
+    # ALL task types reach this completion call
     try:
         cp = json.dumps({"task_id": task_id, "provider_id": identity.node_id, "result_payload": json.dumps(result)})
         r = requests.post(f"{HUB_HTTP}/tasks/complete", headers=auth_headers(cp), data=cp, timeout=10)
@@ -84,14 +86,17 @@ async def handle_task(data: dict):
         log(f"❌ Complete failed: {e}")
 
 async def listen():
+    retry_delay = 1
+    max_delay = 60
     while True:
         try:
             ts = str(int(time.time()))
             sig = identity.sign(identity.node_id, ts)
             uri = f"{HUB_WS}/ws/{identity.node_id}?timestamp={ts}&signature={urllib.parse.quote(sig)}"
-            log(f"Connecting...")
+            log(f"Connecting (retry_delay={retry_delay}s)...")
             async with websockets.connect(uri, ping_interval=20) as ws:
                 log(f"✅ Connected as {identity.node_id}")
+                retry_delay = 1  # Reset on successful connect
                 async def hb():
                     while True:
                         await asyncio.sleep(30)
@@ -108,9 +113,15 @@ async def listen():
                     edata = data.get("data", {})
                     if event == "new_task":
                         asyncio.create_task(handle_task(edata))
+        except websockets.exceptions.ConnectionClosed as e:
+            log(f"⚠️ ConnectionClosed: {e}")
+        except asyncio.TimeoutError as e:
+            log(f"⚠️ Timeout: {e}")
         except Exception as e:
-            log(f"Reconnect: {e}")
-            await asyncio.sleep(5)
+            log(f"⚠️ Reconnect: {type(e).__name__}: {e}")
+        # Exponential backoff with jitter, capped at max_delay
+        await asyncio.sleep(retry_delay + random.uniform(0, 1))
+        retry_delay = min(retry_delay * 2, max_delay)
 
 if __name__ == "__main__":
     if not os.path.exists(KEY_PATH):
